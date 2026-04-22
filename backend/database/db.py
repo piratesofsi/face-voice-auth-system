@@ -34,6 +34,28 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS broadcasts (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            message    TEXT NOT NULL,
+            sent_by    TEXT,
+            sent_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_auth_methods (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER NOT NULL,
+            method     TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, method),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+    conn.execute("""
+        INSERT OR IGNORE INTO user_auth_methods (user_id, method)
+        SELECT id, auth_method FROM users WHERE auth_method IS NOT NULL
+    """)
     conn.commit()
     conn.close()
     print("Database ready!")

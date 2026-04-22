@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header, Body
 from database.db import get_db
 from core.security import decode_token
 from core.email_service import send_account_disabled_alert
@@ -63,8 +63,8 @@ def get_logs(authorization: str = Header(...)):
 
 @router.get("/my-logs")
 def my_logs(authorization: str = Header(...)):
-    payload = require_auth(authorization)
-    email = payload.get("email")
+    user = require_auth(authorization)
+    email = user["email"]
     db = get_db()
     logs = db.execute(
         "SELECT * FROM access_logs WHERE email=? ORDER BY logged_at DESC",
@@ -105,3 +105,38 @@ def change_role(user_id: int, role: str, authorization: str = Header(...)):
     db.commit()
     db.close()
     return {"id": user_id, "role": role}
+
+@router.get("/broadcast/current")
+def get_current_broadcast():
+    db = get_db()
+    row = db.execute(
+        "SELECT id, message, sent_by, sent_at FROM broadcasts ORDER BY sent_at DESC, id DESC LIMIT 1"
+    ).fetchone()
+    db.close()
+    if not row:
+        return None
+    return dict(row)
+
+@router.post("/broadcast")
+def create_broadcast(
+    payload: dict = Body(...),
+    authorization: str = Header(...)
+):
+    admin = require_admin(authorization)
+    message = (payload.get("message") or "").strip()
+    if not message:
+        raise HTTPException(400, "Message is required")
+    if len(message) > 500:
+        raise HTTPException(400, "Message is too long")
+
+    db = get_db()
+    db.execute(
+        "INSERT INTO broadcasts (message, sent_by) VALUES (?, ?)",
+        (message, admin["email"])
+    )
+    db.commit()
+    row = db.execute(
+        "SELECT id, message, sent_by, sent_at FROM broadcasts ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    db.close()
+    return dict(row)

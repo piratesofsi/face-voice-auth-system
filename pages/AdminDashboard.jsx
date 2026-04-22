@@ -4,9 +4,108 @@ import { Search, SuccessRatePie, LoginsOverTime, MetricCard, Button, SectionHead
 const API = "http://localhost:8000";
 const mono = "'DM Mono', monospace";
 const bebas = "'Bebas Neue', sans-serif";
+const tableCardStyle = { background: "rgba(10,10,10,0.9)", border: "1px solid rgba(255,255,255,.06)", borderRadius: 6, overflow: "hidden" };
 
 function authHeaders() {
   return { Authorization: `Bearer ${localStorage.getItem("access_token")}` };
+}
+
+function captureFrameFromStream(stream) {
+  const video = document.createElement("video");
+  video.srcObject = stream;
+  video.muted = true;
+  video.playsInline = true;
+  return new Promise((resolve, reject) => {
+    video.onloadedmetadata = async () => {
+      try {
+        await video.play();
+        const canvas = document.createElement("canvas");
+        canvas.width = video.videoWidth || 640;
+        canvas.height = video.videoHeight || 480;
+        canvas.getContext("2d").drawImage(video, 0, 0);
+        canvas.toBlob((blob) => {
+          if (blob) resolve(blob);
+          else reject(new Error("Failed to capture image"));
+        }, "image/jpeg", 0.92);
+      } catch (err) {
+        reject(err);
+      }
+    };
+    video.onerror = () => reject(new Error("Unable to load camera stream"));
+  });
+}
+
+function mergeAudioBuffers(chunks) {
+  const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const result = new Float32Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return result;
+}
+
+function floatTo16BitPCM(output, offset, input) {
+  for (let i = 0; i < input.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, input[i]));
+    output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+}
+
+function writeString(view, offset, string) {
+  for (let i = 0; i < string.length; i++) {
+    view.setUint8(offset + i, string.charCodeAt(i));
+  }
+}
+
+function encodeWAV(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  writeString(view, 0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(view, 8, "WAVE");
+  writeString(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(view, 36, "data");
+  view.setUint32(40, samples.length * 2, true);
+  floatTo16BitPCM(view, 44, samples);
+  return new Blob([view], { type: "audio/wav" });
+}
+
+async function captureVoice(duration = 2600) {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  const source = audioContext.createMediaStreamSource(stream);
+  const processor = audioContext.createScriptProcessor(4096, 1, 1);
+  const chunks = [];
+
+  source.connect(processor);
+  processor.connect(audioContext.destination);
+
+  return await new Promise((resolve) => {
+    let finished = false;
+    processor.onaudioprocess = (event) => {
+      chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+    };
+    const done = async () => {
+      if (finished) return;
+      finished = true;
+      processor.disconnect();
+      source.disconnect();
+      stream.getTracks().forEach((track) => track.stop());
+      await audioContext.close();
+      const samples = mergeAudioBuffers(chunks);
+      resolve(encodeWAV(samples, audioContext.sampleRate));
+    };
+    setTimeout(done, duration);
+  });
 }
 
 /* ── Sidebar ── */
@@ -17,6 +116,9 @@ const Sidebar = React.memo(function Sidebar({ active, onNav, user, onLogout }) {
     { id: "analytics", icon: "📊", label: "Analytics" },
     ...(isAdmin ? [{ id: "users", icon: "◉", label: "Users" }] : []),
     { id: "logs", icon: "▤", label: "Access Logs" },
+    { id: "security", icon: "🛡", label: "Security" },
+    { id: "operations", icon: "⚡", label: "Operations" },
+    { id: "settings", icon: "⚙", label: "Settings" },
   ], [isAdmin]);
 
   return (
@@ -88,23 +190,6 @@ const Sidebar = React.memo(function Sidebar({ active, onNav, user, onLogout }) {
 });
 
 /* ── Stat card ── */
-function StatCard({ label, value, accent }) {
-  return (
-    <div style={{
-      background: "rgba(10,10,10,0.9)", border: `1px solid ${accent}22`,
-      borderRadius: 6, padding: "20px 24px", flex: 1,
-    }}>
-      <div style={{ fontFamily: mono, fontSize: 8, color: "rgba(255,255,255,.3)", letterSpacing: "0.25em", textTransform: "uppercase", marginBottom: 12 }}>
-        {label}
-      </div>
-      <div style={{ fontFamily: bebas, fontSize: 42, color: accent, letterSpacing: "0.05em", lineHeight: 1 }}>
-        {value}
-      </div>
-    </div>
-  );
-}
-
-/* ── Overview panel ── */
 const Overview = React.memo(function Overview({ users, logs }) {
   const stats = useMemo(() => ({
     active: users.filter(u => u.is_active).length,
@@ -128,7 +213,7 @@ const Overview = React.memo(function Overview({ users, logs }) {
       <div style={{ fontFamily: mono, fontSize: 9, color: "rgba(255,255,255,.3)", letterSpacing: "0.25em", textTransform: "uppercase", marginBottom: 14 }}>
         Recent Activity
       </div>
-      <div style={{ background: "rgba(10,10,10,0.9)", border: "1px solid rgba(255,255,255,.06)", borderRadius: 6, overflow: "hidden" }}>
+      <div style={tableCardStyle}>
         {stats.recent.length === 0 && (
           <div style={{ padding: 24, fontFamily: mono, fontSize: 11, color: "rgba(255,255,255,.2)", textAlign: "center" }}>
             No activity yet
@@ -253,7 +338,7 @@ const Users = React.memo(function Users({ users, onToggle, onRoleChange, current
       <div style={{ fontFamily: bebas, fontSize: 28, color: "#fff", letterSpacing: "0.15em", marginBottom: 24 }}>
         Registered Users
       </div>
-      <div style={{ background: "rgba(10,10,10,0.9)", border: "1px solid rgba(255,255,255,.06)", borderRadius: 6, overflow: "hidden" }}>
+      <div style={tableCardStyle}>
         {/* Header */}
         <div style={{
           display: "grid", gridTemplateColumns: "1.2fr 1.5fr 1fr 1fr 1.2fr 1.2fr",
@@ -346,7 +431,7 @@ const Logs = React.memo(function Logs({ logs, onSearch, onRefresh }) {
         </div>
       </div>
 
-      <div style={{ background: "rgba(10,10,10,0.9)", border: "1px solid rgba(255,255,255,.06)", borderRadius: 6, overflow: "hidden" }}>
+      <div style={tableCardStyle}>
         <div style={{
           display: "grid", gridTemplateColumns: "1.2fr 1.5fr 1fr 1.2fr 1.5fr",
           columnGap: "12px",
@@ -371,6 +456,301 @@ const Logs = React.memo(function Logs({ logs, onSearch, onRefresh }) {
   );
 });
 
+/* ── Security panel ── */
+const Security = React.memo(function Security({ users, logs }) {
+  const riskSummary = useMemo(() => {
+    const failedByEmail = logs.reduce((acc, log) => {
+      if (log.status !== "failed") return acc;
+      const key = log.email || "unknown";
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {});
+
+    const topRiskAccounts = Object.entries(failedByEmail)
+      .map(([email, failedAttempts]) => ({
+        email,
+        failedAttempts,
+        user: users.find((u) => u.email === email),
+      }))
+      .sort((a, b) => b.failedAttempts - a.failedAttempts)
+      .slice(0, 5);
+
+    const methodDistribution = logs.reduce((acc, log) => {
+      const method = log.method || "unknown";
+      acc[method] = (acc[method] || 0) + 1;
+      return acc;
+    }, {});
+
+    const today = new Date().toDateString();
+    const todayAttempts = logs.filter((log) => new Date(log.logged_at).toDateString() === today).length;
+    const failedToday = logs.filter((log) => log.status === "failed" && new Date(log.logged_at).toDateString() === today).length;
+
+    return {
+      topRiskAccounts,
+      methodDistribution,
+      todayAttempts,
+      failedToday,
+      inactiveUsers: users.filter((u) => !u.is_active).length,
+    };
+  }, [users, logs]);
+
+  return (
+    <div>
+      <SectionHeader title="Security Center" subtitle="Monitor threats, suspicious activity, and authentication patterns." />
+      <CardGrid gap={16}>
+        <MetricCard label="Attempts Today" value={riskSummary.todayAttempts} accent="#00ffe0" />
+        <MetricCard label="Failed Today" value={riskSummary.failedToday} accent="#ff2d78" />
+        <MetricCard label="Inactive Users" value={riskSummary.inactiveUsers} accent="#ff8c00" />
+      </CardGrid>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 16, marginTop: 20 }}>
+        <div style={{ ...tableCardStyle, padding: 16 }}>
+          <div style={{ fontFamily: mono, fontSize: 9, color: "rgba(255,255,255,.35)", letterSpacing: "0.2em", textTransform: "uppercase", marginBottom: 14 }}>
+            Top Risk Accounts (Failed Attempts)
+          </div>
+          {riskSummary.topRiskAccounts.length === 0 && (
+            <div style={{ fontFamily: mono, fontSize: 11, color: "rgba(255,255,255,.35)", padding: 10 }}>
+              No failed attempts recorded.
+            </div>
+          )}
+          {riskSummary.topRiskAccounts.map((entry) => (
+            <div key={entry.email} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 8px", borderBottom: "1px solid rgba(255,255,255,.05)" }}>
+              <div>
+                <div style={{ fontFamily: mono, fontSize: 10, color: "#fff" }}>{entry.user?.name || "Unknown user"}</div>
+                <div style={{ fontFamily: mono, fontSize: 9, color: "rgba(255,255,255,.35)", marginTop: 3 }}>{entry.email}</div>
+              </div>
+              <div style={{ fontFamily: bebas, fontSize: 24, color: "#ff2d78", letterSpacing: "0.06em" }}>{entry.failedAttempts}</div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ ...tableCardStyle, padding: 16 }}>
+          <div style={{ fontFamily: mono, fontSize: 9, color: "rgba(255,255,255,.35)", letterSpacing: "0.2em", textTransform: "uppercase", marginBottom: 14 }}>
+            Authentication Mix
+          </div>
+          {Object.keys(riskSummary.methodDistribution).length === 0 && (
+            <div style={{ fontFamily: mono, fontSize: 11, color: "rgba(255,255,255,.35)", padding: 10 }}>
+              No auth methods recorded yet.
+            </div>
+          )}
+          {Object.entries(riskSummary.methodDistribution).map(([method, count]) => (
+            <div key={method} style={{ marginBottom: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                <span style={{ fontFamily: mono, fontSize: 9, color: "rgba(255,255,255,.65)", textTransform: "uppercase" }}>{method}</span>
+                <span style={{ fontFamily: mono, fontSize: 9, color: "#00ffe0" }}>{count}</span>
+              </div>
+              <div style={{ height: 6, borderRadius: 999, background: "rgba(255,255,255,.07)" }}>
+                <div
+                  style={{
+                    height: "100%",
+                    borderRadius: 999,
+                    width: `${Math.max(8, (count / Math.max(logs.length, 1)) * 100)}%`,
+                    background: "linear-gradient(90deg, rgba(0,255,224,.8), rgba(89,179,255,.8))",
+                  }}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+});
+
+/* ── Operations panel ── */
+const Operations = React.memo(function Operations({ users, logs, onRefresh, onQuickDisable, onExportLogs, onSendBroadcast, currentBroadcast }) {
+  const [announcement, setAnnouncement] = useState("");
+
+  const opsStats = useMemo(() => {
+    const activeUsers = users.filter((u) => u.is_active).length;
+    const lastLog = logs[0];
+    return { activeUsers, totalUsers: users.length, lastEvent: lastLog ? new Date(lastLog.logged_at).toLocaleString() : "No events" };
+  }, [users, logs]);
+
+  const sendBroadcast = async () => {
+    if (!announcement.trim()) return;
+    await onSendBroadcast(announcement.trim());
+    setAnnouncement("");
+  };
+
+  return (
+    <div>
+      <SectionHeader title="Operations Hub" subtitle="Run quick operational actions and team communication." />
+      <CardGrid gap={16}>
+        <MetricCard label="Users Active Now" value={opsStats.activeUsers} accent="#00ffe0" small />
+        <MetricCard label="Total Users" value={opsStats.totalUsers} accent="#59b3ff" small />
+        <MetricCard label="Recent Event" value={opsStats.lastEvent} accent="#ff8c00" small />
+      </CardGrid>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 20 }}>
+        <div style={{ ...tableCardStyle, padding: 18 }}>
+          <div style={{ fontFamily: mono, fontSize: 10, color: "#fff", marginBottom: 12, letterSpacing: "0.15em", textTransform: "uppercase" }}>
+            Quick Actions
+          </div>
+          <div style={{ display: "grid", gap: 10 }}>
+            <Button onClick={onRefresh}>Sync Data</Button>
+            <Button variant="secondary" onClick={onExportLogs}>Export Logs (CSV)</Button>
+            <Button variant="secondary" onClick={onQuickDisable}>Disable Highest-Risk Account</Button>
+          </div>
+        </div>
+
+        <div style={{ ...tableCardStyle, padding: 18 }}>
+          <div style={{ fontFamily: mono, fontSize: 10, color: "#fff", marginBottom: 12, letterSpacing: "0.15em", textTransform: "uppercase" }}>
+            Broadcast Message
+          </div>
+          <textarea
+            value={announcement}
+            onChange={(e) => setAnnouncement(e.target.value)}
+            placeholder="Post a maintenance note for your team..."
+            style={{
+              width: "100%",
+              minHeight: 90,
+              background: "rgba(255,255,255,.03)",
+              border: "1px solid rgba(255,255,255,.1)",
+              borderRadius: 4,
+              color: "#fff",
+              padding: 10,
+              resize: "vertical",
+              fontFamily: mono,
+              fontSize: 10,
+              marginBottom: 10,
+            }}
+          />
+          <Button onClick={sendBroadcast} disabled={!announcement.trim()}>Send Broadcast</Button>
+          {currentBroadcast && (
+            <div style={{ marginTop: 10, fontFamily: mono, fontSize: 9, color: "rgba(255,255,255,.45)" }}>
+              Last: "{currentBroadcast.message}" ({new Date(currentBroadcast.sent_at).toLocaleString()})
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+});
+
+const AdminSettings = React.memo(function AdminSettings({ user }) {
+  const [draftPassword, setDraftPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [enabledMethods, setEnabledMethods] = useState(user?.auth_methods || []);
+  const [status, setStatus] = useState("");
+  const [updatingMethod, setUpdatingMethod] = useState("");
+
+  const syncUserMethods = (methods) => {
+    setEnabledMethods(methods || []);
+    const savedUser = JSON.parse(localStorage.getItem("user") || "{}");
+    localStorage.setItem("user", JSON.stringify({ ...savedUser, auth_methods: methods || [] }));
+  };
+
+  const enrollMethod = async (method, opts = {}) => {
+    const form = new FormData();
+    form.append("method", method);
+    if (opts.password) form.append("password", opts.password);
+    if (opts.file) form.append("file", opts.file, opts.filename || "sample.bin");
+    const res = await fetch(`${API}/auth/enroll-method`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: form,
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.detail || "Failed to update method");
+    syncUserMethods(data.auth_methods || []);
+  };
+
+  const updatePassword = async () => {
+    if (!draftPassword || draftPassword.length < 8) {
+      setStatus("Password must be at least 8 characters.");
+      return;
+    }
+    if (draftPassword !== confirmPassword) {
+      setStatus("Password confirmation does not match.");
+      return;
+    }
+    try {
+      setUpdatingMethod("password");
+      await enrollMethod("none", { password: draftPassword });
+      setDraftPassword("");
+      setConfirmPassword("");
+      setStatus("Password updated successfully.");
+    } catch (err) {
+      setStatus(err.message);
+    } finally {
+      setUpdatingMethod("");
+    }
+  };
+
+  const updateFace = async () => {
+    try {
+      setUpdatingMethod("face");
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      const blob = await captureFrameFromStream(stream);
+      stream.getTracks().forEach((t) => t.stop());
+      await enrollMethod("face", { file: blob, filename: "face.jpg" });
+      setStatus("Face profile updated.");
+    } catch (err) {
+      setStatus(err.message || "Face update failed.");
+    } finally {
+      setUpdatingMethod("");
+    }
+  };
+
+  const updateVoice = async () => {
+    try {
+      setUpdatingMethod("voice");
+      const blob = await captureVoice(2600);
+      await enrollMethod("voice", { file: blob, filename: "voice.wav" });
+      setStatus("Voice profile updated.");
+    } catch (err) {
+      setStatus(err.message || "Voice update failed.");
+    } finally {
+      setUpdatingMethod("");
+    }
+  };
+
+  return (
+    <div>
+      <SectionHeader title="Admin Settings" subtitle="Manage your own authentication credentials and biometric profiles." />
+      <div style={{ background: "rgba(10,10,10,0.9)", border: "1px solid rgba(255,255,255,.08)", borderRadius: 6, padding: 20, maxWidth: 640 }}>
+        <div style={{ fontFamily: mono, fontSize: 10, color: "#fff", letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 14 }}>
+          Security Credentials
+        </div>
+        <input
+          type="password"
+          value={draftPassword}
+          onChange={(e) => setDraftPassword(e.target.value)}
+          placeholder="New password"
+          style={{ width: "100%", marginBottom: 10, background: "rgba(255,255,255,.03)", border: "1px solid rgba(255,255,255,.12)", borderRadius: 4, color: "#fff", padding: "10px 12px", fontFamily: mono }}
+        />
+        <input
+          type="password"
+          value={confirmPassword}
+          onChange={(e) => setConfirmPassword(e.target.value)}
+          placeholder="Confirm password"
+          style={{ width: "100%", marginBottom: 10, background: "rgba(255,255,255,.03)", border: "1px solid rgba(255,255,255,.12)", borderRadius: 4, color: "#fff", padding: "10px 12px", fontFamily: mono }}
+        />
+        <div style={{ display: "grid", gap: 8 }}>
+          <Button onClick={updatePassword} disabled={updatingMethod !== ""}>
+            {updatingMethod === "password" ? "Updating Password..." : "Update Password"}
+          </Button>
+          <Button variant="secondary" onClick={updateFace} disabled={updatingMethod !== ""}>
+            {updatingMethod === "face" ? "Updating Face..." : "Update Face Profile"}
+          </Button>
+          <Button variant="secondary" onClick={updateVoice} disabled={updatingMethod !== ""}>
+            {updatingMethod === "voice" ? "Updating Voice..." : "Update Voice Profile"}
+          </Button>
+        </div>
+        <div style={{ marginTop: 12, fontFamily: mono, fontSize: 9, color: "rgba(0,255,224,.6)" }}>
+          Enabled methods: {enabledMethods.length ? enabledMethods.join(", ") : "none"}
+        </div>
+      </div>
+      {status && (
+        <div style={{ marginTop: 14, padding: "10px 12px", border: "1px solid rgba(0,255,224,.2)", borderRadius: 4, color: "#00ffe0", fontFamily: mono, fontSize: 9, letterSpacing: "0.08em" }}>
+          {status}
+        </div>
+      )}
+    </div>
+  );
+});
+
 /* ── Main ── */
 export default function AdminDashboard({ user, onLogout }) {
   const [active, setActive] = useState("overview");
@@ -379,6 +759,8 @@ export default function AdminDashboard({ user, onLogout }) {
   const [logs, setLogs] = useState([]);
   const [filteredLogs, setFilteredLogs] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [actionMessage, setActionMessage] = useState("");
+  const [currentBroadcast, setCurrentBroadcast] = useState(null);
 
   const fetchData = useCallback(async () => {
     try {
@@ -407,6 +789,21 @@ export default function AdminDashboard({ user, onLogout }) {
     fetchData(); 
   }, [fetchData]);
 
+  const fetchCurrentBroadcast = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/admin/broadcast/current`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setCurrentBroadcast(data || null);
+    } catch {
+      setCurrentBroadcast(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchCurrentBroadcast();
+  }, [fetchCurrentBroadcast]);
+
   const handleToggle = useCallback(async (userId) => {
     await fetch(`${API}/admin/users/${userId}/toggle`, {
       method: "PATCH", headers: authHeaders(),
@@ -432,6 +829,82 @@ export default function AdminDashboard({ user, onLogout }) {
       alert("Error changing role. Check console.");
     }
   }, [fetchData]);
+
+  const exportLogsCsv = useCallback(() => {
+    if (!logs.length) {
+      setActionMessage("No logs to export.");
+      return;
+    }
+    const header = ["id", "user_name", "email", "method", "status", "logged_at"];
+    const rows = logs.map((log) => header.map((key) => `"${String(log[key] ?? "").replace(/"/g, '""')}"`).join(","));
+    const csv = [header.join(","), ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `access-logs-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    setActionMessage("Logs exported successfully.");
+  }, [logs]);
+
+  const disableHighestRiskAccount = useCallback(async () => {
+    if (!users.length || !logs.length) {
+      setActionMessage("Not enough data to run risk action.");
+      return;
+    }
+    const failedByEmail = logs.reduce((acc, log) => {
+      if (log.status !== "failed") return acc;
+      const key = log.email || "";
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {});
+
+    const topRisk = users
+      .filter((u) => u.id !== user?.id && u.is_active)
+      .map((u) => ({ userId: u.id, score: failedByEmail[u.email] || 0, email: u.email }))
+      .sort((a, b) => b.score - a.score)[0];
+
+    if (!topRisk || topRisk.score === 0) {
+      setActionMessage("No risky active account found.");
+      return;
+    }
+
+    try {
+      await fetch(`${API}/admin/users/${topRisk.userId}/toggle`, {
+        method: "PATCH",
+        headers: authHeaders(),
+      });
+      setActionMessage(`Disabled ${topRisk.email} (${topRisk.score} failed attempts).`);
+      fetchData();
+    } catch {
+      setActionMessage("Failed to disable risky account.");
+    }
+  }, [users, logs, user?.id, fetchData]);
+
+  const sendBroadcast = useCallback(async (message) => {
+    try {
+      const res = await fetch(`${API}/admin/broadcast`, {
+        method: "POST",
+        headers: {
+          ...authHeaders(),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ message }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setActionMessage(data?.detail || "Failed to send broadcast.");
+        return;
+      }
+      setCurrentBroadcast(data);
+      setActionMessage("Broadcast sent to all users.");
+    } catch {
+      setActionMessage("Failed to send broadcast.");
+    }
+  }, []);
 
   // Memoize chart data
   const chartData = useMemo(() => ({
@@ -463,6 +936,20 @@ export default function AdminDashboard({ user, onLogout }) {
             </div>
           ) : (
             <>
+              {actionMessage && (
+                <div style={{
+                  marginBottom: 14,
+                  padding: "10px 12px",
+                  border: "1px solid rgba(0,255,224,.2)",
+                  borderRadius: 4,
+                  color: "#00ffe0",
+                  fontFamily: mono,
+                  fontSize: 9,
+                  letterSpacing: "0.08em"
+                }}>
+                  {actionMessage}
+                </div>
+              )}
               {active === "overview" && <Overview users={users} logs={logs} />}
               {active === "analytics" && (
                 <div>
@@ -489,6 +976,19 @@ export default function AdminDashboard({ user, onLogout }) {
                 </div>
               )}
               {active === "logs" && <Logs logs={filteredLogs} onSearch={setFilteredLogs} onRefresh={fetchData} />}
+              {active === "security" && <Security users={users} logs={logs} />}
+              {active === "operations" && (
+                <Operations
+                  users={users}
+                  logs={logs}
+                  onRefresh={fetchData}
+                  onQuickDisable={disableHighestRiskAccount}
+                  onExportLogs={exportLogsCsv}
+                  onSendBroadcast={sendBroadcast}
+                  currentBroadcast={currentBroadcast}
+                />
+              )}
+              {active === "settings" && <AdminSettings user={user} />}
             </>
           )}
         </main>

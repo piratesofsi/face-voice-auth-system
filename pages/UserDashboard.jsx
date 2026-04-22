@@ -4,9 +4,110 @@ import { Search, SuccessRatePie, LoginsOverTime, MetricCard, Button, SectionHead
 const API = "http://localhost:8000";
 const mono = "'DM Mono', monospace";
 const bebas = "'Bebas Neue', sans-serif";
+const SETTINGS_KEY = "user_dashboard_settings";
 
 function authHeaders() {
   return { Authorization: `Bearer ${localStorage.getItem("access_token")}` };
+}
+
+function captureFrameFromStream(stream) {
+  const video = document.createElement("video");
+  video.srcObject = stream;
+  video.muted = true;
+  video.playsInline = true;
+  return new Promise((resolve, reject) => {
+    video.onloadedmetadata = async () => {
+      try {
+        await video.play();
+        const canvas = document.createElement("canvas");
+        canvas.width = video.videoWidth || 640;
+        canvas.height = video.videoHeight || 480;
+        canvas.getContext("2d").drawImage(video, 0, 0);
+        canvas.toBlob((blob) => {
+          if (blob) resolve(blob);
+          else reject(new Error("Failed to capture image"));
+        }, "image/jpeg", 0.92);
+      } catch (err) {
+        reject(err);
+      }
+    };
+    video.onerror = () => reject(new Error("Unable to load camera stream"));
+  });
+}
+
+function mergeAudioBuffers(chunks) {
+  const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const result = new Float32Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return result;
+}
+
+function floatTo16BitPCM(output, offset, input) {
+  for (let i = 0; i < input.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, input[i]));
+    output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+}
+
+function writeString(view, offset, string) {
+  for (let i = 0; i < string.length; i++) {
+    view.setUint8(offset + i, string.charCodeAt(i));
+  }
+}
+
+function encodeWAV(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  writeString(view, 0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(view, 8, "WAVE");
+  writeString(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(view, 36, "data");
+  view.setUint32(40, samples.length * 2, true);
+  floatTo16BitPCM(view, 44, samples);
+  return new Blob([view], { type: "audio/wav" });
+}
+
+async function captureVoice(duration = 2600) {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  const source = audioContext.createMediaStreamSource(stream);
+  const processor = audioContext.createScriptProcessor(4096, 1, 1);
+  const chunks = [];
+
+  source.connect(processor);
+  processor.connect(audioContext.destination);
+
+  return await new Promise((resolve) => {
+    let finished = false;
+    processor.onaudioprocess = (event) => {
+      chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+    };
+
+    const done = async () => {
+      if (finished) return;
+      finished = true;
+      processor.disconnect();
+      source.disconnect();
+      stream.getTracks().forEach((track) => track.stop());
+      await audioContext.close();
+      const samples = mergeAudioBuffers(chunks);
+      resolve(encodeWAV(samples, audioContext.sampleRate));
+    };
+
+    setTimeout(done, duration);
+  });
 }
 
 /* ── Sidebar ── */
@@ -221,6 +322,261 @@ const History = React.memo(function History({ logs, onSearch }) {
   );
 });
 
+const SettingsPanel = React.memo(function SettingsPanel({ logs, user }) {
+  const [settings, setSettings] = useState(() => {
+    try {
+      const saved = localStorage.getItem(SETTINGS_KEY);
+      return saved ? JSON.parse(saved) : {
+        emailAlerts: true,
+        failedAttemptAlerts: true,
+        weeklyDigest: false,
+        reducedMotion: false,
+        compactMode: false,
+        autoLogoutMinutes: 30,
+      };
+    } catch {
+      return {
+        emailAlerts: true,
+        failedAttemptAlerts: true,
+        weeklyDigest: false,
+        reducedMotion: false,
+        compactMode: false,
+        autoLogoutMinutes: 30,
+      };
+    }
+  });
+
+  const [saveNotice, setSaveNotice] = useState("");
+  const [draftPassword, setDraftPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [securityNotice, setSecurityNotice] = useState("");
+  const [updatingMethod, setUpdatingMethod] = useState("");
+  const [enabledMethods, setEnabledMethods] = useState(user?.auth_methods || []);
+
+  useEffect(() => {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    setSaveNotice(`Saved at ${new Date().toLocaleTimeString()}`);
+  }, [settings]);
+
+  const setToggle = (key) => {
+    setSettings((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
+
+  const exportMyActivity = () => {
+    if (!logs.length) {
+      setSecurityNotice("No activity history available.");
+      return;
+    }
+    const header = ["method", "status", "logged_at"];
+    const rows = logs.map((log) => header.map((key) => `"${String(log[key] ?? "").replace(/"/g, '""')}"`).join(","));
+    const csv = [header.join(","), ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `my-login-history-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    setSecurityNotice("Activity export complete.");
+  };
+
+  const updatePasswordPlaceholder = () => {
+    if (!draftPassword || draftPassword.length < 8) {
+      setSecurityNotice("Password must be at least 8 characters.");
+      return;
+    }
+    if (draftPassword !== confirmPassword) {
+      setSecurityNotice("Password confirmation does not match.");
+      return;
+    }
+    setUpdatingMethod("password");
+    const form = new FormData();
+    form.append("method", "none");
+    form.append("password", draftPassword);
+    fetch(`${API}/auth/enroll-method`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: form,
+    })
+      .then(async (res) => {
+        const data = await res.json();
+        if (!res.ok) throw new Error(data?.detail || "Failed to update password");
+        setDraftPassword("");
+        setConfirmPassword("");
+        setEnabledMethods(data.auth_methods || []);
+        const savedUser = JSON.parse(localStorage.getItem("user") || "{}");
+        localStorage.setItem("user", JSON.stringify({ ...savedUser, auth_methods: data.auth_methods || [] }));
+        setSecurityNotice("Password updated successfully.");
+      })
+      .catch((err) => setSecurityNotice(err.message))
+      .finally(() => setUpdatingMethod(""));
+  };
+
+  const updateFace = async () => {
+    try {
+      setUpdatingMethod("face");
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      const blob = await captureFrameFromStream(stream);
+      stream.getTracks().forEach((t) => t.stop());
+
+      const form = new FormData();
+      form.append("method", "face");
+      form.append("file", blob, "face.jpg");
+      const res = await fetch(`${API}/auth/enroll-method`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: form,
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.detail || "Failed to update face");
+      setEnabledMethods(data.auth_methods || []);
+      const savedUser = JSON.parse(localStorage.getItem("user") || "{}");
+      localStorage.setItem("user", JSON.stringify({ ...savedUser, auth_methods: data.auth_methods || [] }));
+      setSecurityNotice("Face profile updated.");
+    } catch (err) {
+      setSecurityNotice(err.message || "Face update failed.");
+    } finally {
+      setUpdatingMethod("");
+    }
+  };
+
+  const updateVoice = async () => {
+    try {
+      setUpdatingMethod("voice");
+      const blob = await captureVoice(2600);
+      const form = new FormData();
+      form.append("method", "voice");
+      form.append("file", blob, "voice.wav");
+      const res = await fetch(`${API}/auth/enroll-method`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: form,
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.detail || "Failed to update voice");
+      setEnabledMethods(data.auth_methods || []);
+      const savedUser = JSON.parse(localStorage.getItem("user") || "{}");
+      localStorage.setItem("user", JSON.stringify({ ...savedUser, auth_methods: data.auth_methods || [] }));
+      setSecurityNotice("Voice profile updated.");
+    } catch (err) {
+      setSecurityNotice(err.message || "Voice update failed.");
+    } finally {
+      setUpdatingMethod("");
+    }
+  };
+
+  return (
+    <div>
+      <SectionHeader title="Settings" subtitle="Control notifications, session security, and account preferences." />
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        <div style={{ background: "rgba(10,10,10,0.9)", border: "1px solid rgba(0,255,224,.1)", borderRadius: 6, padding: 20 }}>
+          <div style={{ fontFamily: mono, fontSize: 10, color: "#00ffe0", letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 14 }}>
+            Notifications
+          </div>
+          {[
+            { key: "emailAlerts", label: "Email alerts for new sign-ins" },
+            { key: "failedAttemptAlerts", label: "Notify on failed attempts" },
+            { key: "weeklyDigest", label: "Weekly security digest" },
+          ].map((item) => (
+            <label key={item.key} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, fontFamily: mono, fontSize: 10, color: "rgba(255,255,255,.75)" }}>
+              {item.label}
+              <input type="checkbox" checked={settings[item.key]} onChange={() => setToggle(item.key)} />
+            </label>
+          ))}
+        </div>
+
+        <div style={{ background: "rgba(10,10,10,0.9)", border: "1px solid rgba(0,255,224,.1)", borderRadius: 6, padding: 20 }}>
+          <div style={{ fontFamily: mono, fontSize: 10, color: "#00ffe0", letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 14 }}>
+            Experience
+          </div>
+          {[
+            { key: "reducedMotion", label: "Reduced motion mode" },
+            { key: "compactMode", label: "Compact dashboard layout" },
+          ].map((item) => (
+            <label key={item.key} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, fontFamily: mono, fontSize: 10, color: "rgba(255,255,255,.75)" }}>
+              {item.label}
+              <input type="checkbox" checked={settings[item.key]} onChange={() => setToggle(item.key)} />
+            </label>
+          ))}
+          <label style={{ display: "block", marginTop: 12, fontFamily: mono, fontSize: 10, color: "rgba(255,255,255,.75)" }}>
+            Auto logout (minutes)
+            <input
+              type="number"
+              min={5}
+              max={180}
+              value={settings.autoLogoutMinutes}
+              onChange={(e) => setSettings((prev) => ({ ...prev, autoLogoutMinutes: Math.max(5, Math.min(180, Number(e.target.value) || 30)) }))}
+              style={{
+                marginTop: 8,
+                width: "100%",
+                background: "rgba(255,255,255,.03)",
+                border: "1px solid rgba(255,255,255,.12)",
+                borderRadius: 4,
+                color: "#fff",
+                padding: "10px 12px",
+                fontFamily: mono,
+              }}
+            />
+          </label>
+          <div style={{ marginTop: 10, fontFamily: mono, fontSize: 9, color: "rgba(0,255,224,.6)" }}>{saveNotice}</div>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 16 }}>
+        <div style={{ background: "rgba(10,10,10,0.9)", border: "1px solid rgba(255,255,255,.08)", borderRadius: 6, padding: 20 }}>
+          <div style={{ fontFamily: mono, fontSize: 10, color: "#fff", letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 14 }}>
+            Security
+          </div>
+          <input
+            type="password"
+            value={draftPassword}
+            onChange={(e) => setDraftPassword(e.target.value)}
+            placeholder="New password"
+            style={{ width: "100%", marginBottom: 10, background: "rgba(255,255,255,.03)", border: "1px solid rgba(255,255,255,.12)", borderRadius: 4, color: "#fff", padding: "10px 12px", fontFamily: mono }}
+          />
+          <input
+            type="password"
+            value={confirmPassword}
+            onChange={(e) => setConfirmPassword(e.target.value)}
+            placeholder="Confirm password"
+            style={{ width: "100%", marginBottom: 10, background: "rgba(255,255,255,.03)", border: "1px solid rgba(255,255,255,.12)", borderRadius: 4, color: "#fff", padding: "10px 12px", fontFamily: mono }}
+          />
+          <Button onClick={updatePasswordPlaceholder}>Update Password</Button>
+          <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+            <Button variant="secondary" onClick={updateFace} disabled={updatingMethod !== ""}>
+              {updatingMethod === "face" ? "Updating Face..." : "Update Face Profile"}
+            </Button>
+            <Button variant="secondary" onClick={updateVoice} disabled={updatingMethod !== ""}>
+              {updatingMethod === "voice" ? "Updating Voice..." : "Update Voice Profile"}
+            </Button>
+          </div>
+          <div style={{ marginTop: 12, fontFamily: mono, fontSize: 9, color: "rgba(0,255,224,.6)" }}>
+            Enabled methods: {enabledMethods.length ? enabledMethods.join(", ") : "none"}
+          </div>
+        </div>
+
+        <div style={{ background: "rgba(10,10,10,0.9)", border: "1px solid rgba(255,255,255,.08)", borderRadius: 6, padding: 20 }}>
+          <div style={{ fontFamily: mono, fontSize: 10, color: "#fff", letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 14 }}>
+            Data Controls
+          </div>
+          <Button variant="secondary" onClick={exportMyActivity}>Export My Login Activity</Button>
+          <div style={{ marginTop: 12, fontFamily: mono, fontSize: 9, color: "rgba(255,255,255,.45)" }}>
+            Download your personal login history for audits and backup.
+          </div>
+        </div>
+      </div>
+
+      {securityNotice && (
+        <div style={{ marginTop: 14, padding: "10px 12px", border: "1px solid rgba(0,255,224,.2)", borderRadius: 4, color: "#00ffe0", fontFamily: mono, fontSize: 9, letterSpacing: "0.08em" }}>
+          {securityNotice}
+        </div>
+      )}
+    </div>
+  );
+});
+
 /* ── Main ── */
 export default function UserDashboard({ user, onLogout }) {
   const [active, setActive] = useState("profile");
@@ -281,25 +637,7 @@ export default function UserDashboard({ user, onLogout }) {
             </div>
           )}
           {active === "settings" && (
-            <div>
-              <div style={{ fontFamily: bebas, fontSize: 28, color: "#fff", letterSpacing: "0.15em", marginBottom: 24 }}>
-                Settings
-              </div>
-              <div style={{
-                background: "rgba(10,10,10,0.9)", border: "1px solid rgba(0,255,224,.1)",
-                borderRadius: 6, padding: "32px",
-              }}>
-                <h3 style={{ fontFamily: mono, fontSize: 14, color: "#00ffe0", marginBottom: 20, letterSpacing: "0.1em" }}>
-                  Account Settings
-                </h3>
-                <p style={{ fontFamily: mono, fontSize: 11, color: "rgba(255,255,255,.6)", marginBottom: 24 }}>
-                  Change password, notification preferences, and more coming soon.
-                </p>
-                <Button variant="primary" style={{ width: '100%', justifyContent: 'center' }}>
-                  Update Password
-                </Button>
-              </div>
-            </div>
+            <SettingsPanel logs={logs} user={user} />
           )}
         </main>
       </div>

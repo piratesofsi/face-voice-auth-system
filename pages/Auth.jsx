@@ -1,6 +1,12 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 
 const API = "http://localhost:8000";
+const CORNER_POSITIONS = [
+  { top: 20, left: 20, rotate: "0deg" },
+  { top: 20, right: 20, rotate: "90deg" },
+  { bottom: 20, right: 20, rotate: "180deg" },
+  { bottom: 20, left: 20, rotate: "270deg" },
+];
 
 /* ── Capture a JPEG blob from a video element ── */
 function captureFrame(videoEl) {
@@ -143,6 +149,16 @@ function BiometricFeed({ mode, videoRef }) {
   const streamRef = useRef(null);
   const [ready, setReady] = useState(false);
   const [tick, setTick] = useState(false);
+  const voiceBars = useMemo(
+    () =>
+      Array.from({ length: 18 }, (_, i) => ({
+        id: i,
+        duration: `${(0.35 + ((i % 6) * 0.1)).toFixed(2)}s`,
+        delay: `${(i * 0.04).toFixed(2)}s`,
+        height: `${26 + ((i * 11) % 44)}%`,
+      })),
+    []
+  );
 
   useEffect(() => {
     if (mode === "face") {
@@ -186,12 +202,12 @@ function BiometricFeed({ mode, videoRef }) {
           width: "100%", height: "100%", display: "flex",
           alignItems: "center", justifyContent: "center", gap: 3, padding: "0 16px",
         }}>
-          {Array.from({ length: 18 }).map((_, i) => (
-            <div key={i} style={{
+          {voiceBars.map((bar) => (
+            <div key={bar.id} style={{
               width: 3, borderRadius: 2, background: "rgba(0,255,224,0.7)",
-              animation: `voicebar ${0.35 + Math.random() * 0.55}s ease-in-out infinite alternate`,
-              animationDelay: `${i * 0.04}s`,
-              height: `${22 + Math.random() * 55}%`,
+              animation: `voicebar ${bar.duration} ease-in-out infinite alternate`,
+              animationDelay: bar.delay,
+              height: bar.height,
             }} />
           ))}
         </div>
@@ -386,6 +402,7 @@ export default function AuthPage({ onSuccess }) {
   const [recording, setRecording] = useState(false);
   const [recordError, setRecordError] = useState(null);
   const [micSupported, setMicSupported] = useState(true);
+  const [reduceMotion, setReduceMotion] = useState(false);
   const videoRef                = useRef(null);
 
   useEffect(() => { setTimeout(() => setVisible(true), 80); }, []);
@@ -394,6 +411,14 @@ export default function AuthPage({ onSuccess }) {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setMicSupported(false);
     }
+  }, []);
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const updatePref = () => setReduceMotion(mediaQuery.matches);
+    updatePref();
+    mediaQuery.addEventListener("change", updatePref);
+    return () => mediaQuery.removeEventListener("change", updatePref);
   }, []);
 
   useEffect(() => {
@@ -530,6 +555,9 @@ export default function AuthPage({ onSuccess }) {
         @keyframes voicebar { from{transform:scaleY(.25)} to{transform:scaleY(1)} }
         @keyframes pulseRing { 0%{box-shadow:0 0 0 0 rgba(0,255,224,.4)} 70%{box-shadow:0 0 0 8px rgba(0,255,224,0)} 100%{box-shadow:0 0 0 0 rgba(0,255,224,0)} }
         @keyframes statusIn { from{opacity:0;transform:translateY(5px)} to{opacity:1;transform:translateY(0)} }
+        @media (prefers-reduced-motion: reduce) {
+          *, *::before, *::after { animation: none !important; transition: none !important; }
+        }
       `}</style>
 
       <div style={{
@@ -538,7 +566,7 @@ export default function AuthPage({ onSuccess }) {
         position: "relative", overflow: "hidden",
         fontFamily: "'DM Mono', monospace",
       }}>
-        <NoiseBg />
+        {!reduceMotion && <NoiseBg />}
         <div style={{
           position: "fixed", inset: 0, pointerEvents: "none", zIndex: 0,
           backgroundImage: "linear-gradient(rgba(0,255,224,.022) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,224,.022) 1px,transparent 1px)",
@@ -548,12 +576,7 @@ export default function AuthPage({ onSuccess }) {
           position: "fixed", inset: 0, pointerEvents: "none", zIndex: 2,
           background: "repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.06) 2px,rgba(0,0,0,.06) 4px)",
         }} />
-        {[
-          { top: 20, left: 20, rotate: "0deg" },
-          { top: 20, right: 20, rotate: "90deg" },
-          { bottom: 20, right: 20, rotate: "180deg" },
-          { bottom: 20, left: 20, rotate: "270deg" },
-        ].map((pos, i) => (
+        {CORNER_POSITIONS.map((pos, i) => (
           <svg key={i} width="36" height="36" viewBox="0 0 36 36" style={{
             position: "fixed", ...pos, zIndex: 2, opacity: 0.2,
             transform: `rotate(${pos.rotate})`,
