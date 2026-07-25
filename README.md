@@ -196,7 +196,7 @@ Frontend runs on `http://localhost:5173`
 
 ## 🖥 Screenshots
 
-> Add screenshots of your auth page, admin dashboard, and user dashboard here
+
 
 ---
 
